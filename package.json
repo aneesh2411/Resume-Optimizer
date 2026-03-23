@@ -1,0 +1,46 @@
+{
+  "name": "resume-optimizer",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "next": "15.2.3",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "@supabase/supabase-js": "^2.47.0",
+    "@supabase/ssr": "^0.5.2",
+    "@upstash/redis": "^1.34.3",
+    "zustand": "^5.0.2",
+    "@react-pdf/renderer": "^4.1.5",
+    "langfuse": "^3.30.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^2.6.0",
+    "lucide-react": "^0.469.0",
+    "zod": "^3.24.1",
+    "puppeteer-core": "^23.11.1",
+    "@sparticuz/chromium": "^132.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9",
+    "eslint-config-next": "15.2.3",
+    "@testing-library/react": "^16.2.0",
+    "@testing-library/user-event": "^14.5.2",
+    "tailwindcss": "^4.0.0",
+    "@tailwindcss/postcss": "^4.0.0"
+  }
+}
