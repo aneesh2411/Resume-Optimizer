@@ -13,6 +13,7 @@ Security:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -20,8 +21,10 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
+from azure.servicebus.aio import ServiceBusClient
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,11 +37,55 @@ load_dotenv()  # load .env / .env.local in development
 from pipeline.graph import graph  # noqa: E402 (must be after load_dotenv)
 from pipeline.nodes.cache import store_cache  # noqa: E402
 from pipeline.schemas import GraphState  # noqa: E402
+from compiler import compile_latex  # noqa: E402
+from models import CompileJob, CompileResult  # noqa: E402
+from storage import upload_pdf  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Resume Pipeline", version="0.1.0", docs_url="/docs")
+
+# ── LaTeX Service Bus consumer ────────────────────────────────────────────────
+
+async def _process_compile_jobs() -> None:
+    """Background task: consume LaTeX compile jobs from Azure Service Bus."""
+    async with ServiceBusClient.from_connection_string(
+        os.environ["SERVICEBUS_CONN"]
+    ) as client:
+        async with client.get_queue_receiver(
+            queue_name=os.environ["SERVICEBUS_QUEUE"],
+            max_wait_time=5,
+        ) as receiver:
+            logger.info("Listening for compile jobs on queue '%s'...", os.environ["SERVICEBUS_QUEUE"])
+            async for msg in receiver:
+                try:
+                    data = json.loads(str(msg))
+                    job = CompileJob(**data)
+                    logger.info("Processing compile job %s for user %s", job.job_id, job.user_id)
+
+                    success, pdf_bytes, error, page_count = compile_latex(job)
+
+                    if success:
+                        pdf_url = upload_pdf(job.job_id, pdf_bytes)
+                        logger.info("Compile job %s complete: %s", job.job_id, pdf_url)
+                    else:
+                        logger.error("Compile job %s failed: %s", job.job_id, error[:200])
+
+                    await receiver.complete_message(msg)
+
+                except Exception as exc:
+                    logger.error("Fatal error processing compile job: %s", exc)
+                    await receiver.dead_letter_message(msg, reason=str(exc))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_process_compile_jobs())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="Resume Pipeline", version="0.1.0", docs_url="/docs", lifespan=lifespan)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 _ALLOWED_ORIGINS = [
@@ -197,3 +244,16 @@ async def cache_status(
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/compile-direct")
+async def compile_direct(job: CompileJob) -> CompileResult:
+    """Direct HTTP endpoint for testing LaTeX compilation without Service Bus."""
+    logger.info("Direct compile request for job %s (user %s)", job.job_id, job.user_id)
+    success, pdf_bytes, error, page_count = compile_latex(job)
+    if success:
+        pdf_url = upload_pdf(job.job_id, pdf_bytes)
+        logger.info("Direct compile job %s complete: %s", job.job_id, pdf_url)
+        return CompileResult(job_id=job.job_id, success=True, pdf_url=pdf_url, page_count=page_count)
+    logger.error("Direct compile job %s failed: %s", job.job_id, error[:200])
+    return CompileResult(job_id=job.job_id, success=False, error=error)
