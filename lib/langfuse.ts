@@ -15,8 +15,6 @@ export function getLangfuse(): Langfuse {
       secretKey: process.env.LANGFUSE_SECRET_KEY!,
       publicKey: process.env.LANGFUSE_PUBLIC_KEY!,
       baseUrl: process.env.LANGFUSE_HOST ?? "https://cloud.langfuse.com",
-      // Flush on process exit in serverless environments
-      flushAtExit: true,
     });
   }
   return _langfuse;
