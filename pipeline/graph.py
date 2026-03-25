@@ -1,36 +1,28 @@
 """
 graph.py — LangGraph stateful agent graph definition.
 
-Graph topology:
+New graph topology:
   [START]
-     │
-  [ingest]         — sanitise + truncate inputs
-     │
-  [compress]       — LLMLingua-2 JD compression
-     │
-  [embed_and_cache] — SHA-256 exact match → pgvector semantic match (cos ≥ 0.92)
-     │                on cache hit: skip directly to resolve
-     ▼              on cache miss: proceed to generate
-  [generate]       — Claude claude-sonnet-4-6 via Instructor → ResumeOutput
-     │
-  [critique]       — parallel: recruiter + hiring_manager + expert (asyncio.gather)
-     │
-  [resolve]        — synthesise 3 CritiqueResults → ConflictResolution
-     │
-     ┤ ← INTERRUPT BEFORE "iterate" (HITL: user sees critique, chooses to accept or refine)
-     │
-  [iterate]        — clear previous outputs, prepare next pass
-     │
-  [generate]       — re-enter generate with user_iteration_feedback
-     │
-  ... (loops up to max_iterations times)
-     │
-  [END]
+    → ingest_node
+    → embed_and_cache_node   (cache hit → END via pdf_url; miss → analyze_latex_node)
+    → analyze_latex_node     (pure regex, no LLM)
+    → generate_node          (Claude → LaTeXOutput)
+    → [Send() fan-out] → critique_persona × N
+    → debate_node
+    → human_review_node      (interrupt(); regen → generate_node; approve/edit → compile_node)
+    → compile_node           (calls /compile-direct; page_count > 1 → compress_latex_node)
+    → compress_latex_node    (regex compression; loops back to compile_node; max 2×)
+    → cache_and_store_node
+    → [END]
 
-The HITL interrupt is implemented via LangGraph's interrupt_before mechanism.
-When paused, the frontend receives the current GraphState via SSE and presents
-the critique to the user. The user submits feedback (or approves), and the
-/api/generate route resumes the graph via the checkpointer thread.
+LangGraph Send() fan-out:
+  fan_out_to_personas() returns list[Send("critique_persona", {...})] — one per
+  selected persona ID. critique_results uses Annotated[list, operator.add] so
+  each worker's {"critique_results": [result]} is merged automatically.
+
+HITL:
+  human_review_node calls interrupt() which raises GraphInterrupt and checkpoints
+  state. Frontend resumes by POST /generate with Command(resume={...}).
 """
 
 from __future__ import annotations
@@ -40,40 +32,28 @@ import logging
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
+from pipeline.nodes.analyze_latex import analyze_latex_node
 from pipeline.nodes.cache import embed_and_cache_node
-from pipeline.nodes.compress import compress_node
-from pipeline.nodes.critique import parallel_critique_node
+from pipeline.nodes.cache_and_store import cache_and_store_node
+from pipeline.nodes.compile import compile_node, route_after_compile
+from pipeline.nodes.compress_latex import compress_latex_node
+from pipeline.nodes.critique import critique_persona_node, fan_out_to_personas
+from pipeline.nodes.debate import debate_node
 from pipeline.nodes.generate import generate_node
+from pipeline.nodes.human_review import human_review_node, route_after_human
 from pipeline.nodes.ingest import ingest_node
-from pipeline.nodes.iterate import iterate_node
-from pipeline.nodes.resolve import join_and_resolve_node
 from pipeline.schemas import GraphState
 
 logger = logging.getLogger(__name__)
 
 
-# ── Routing functions ─────────────────────────────────────────────────────────
+# ── Routing: cache hit vs miss ─────────────────────────────────────────────────
 
 def route_after_cache(state: GraphState) -> str:
-    """After embed_and_cache: skip to resolve if cache hit, else generate."""
-    if state.cache_hit and state.critique_results:
-        return "resolve"
-    if state.cache_hit:
-        return "generate"  # have resume but no critiques — run critique
-    return "generate"
-
-
-def route_after_resolve(state: GraphState) -> str:
-    """
-    After resolve: check if the user approved or max iterations reached.
-    On first pass this always goes to END (HITL interrupt fires before 'iterate').
-    On resume with feedback: either iterate again or end.
-    """
-    if state.error:
-        return END  # type: ignore[return-value]
-    if state.approved or state.iteration_count >= state.max_iterations:
-        return END  # type: ignore[return-value]
-    return "iterate"
+    """After embed_and_cache_node: skip all LLM work on cache hit."""
+    if state.get("cache_hit"):
+        return "hit"
+    return "miss"
 
 
 # ── Graph builder ─────────────────────────────────────────────────────────────
@@ -82,58 +62,75 @@ def build_graph() -> StateGraph:
     builder: StateGraph = StateGraph(GraphState)
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
-    builder.add_node("ingest", ingest_node)
-    builder.add_node("compress", compress_node)
-    builder.add_node("embed_and_cache", embed_and_cache_node)
-    builder.add_node("generate", generate_node)
-    builder.add_node("critique", parallel_critique_node)
-    builder.add_node("resolve", join_and_resolve_node)
-    builder.add_node("iterate", iterate_node)
+    builder.add_node("ingest_node", ingest_node)
+    builder.add_node("embed_and_cache_node", embed_and_cache_node)
+    builder.add_node("analyze_latex_node", analyze_latex_node)
+    builder.add_node("generate_node", generate_node)
+    builder.add_node("critique_persona", critique_persona_node)
+    builder.add_node("debate_node", debate_node)
+    builder.add_node("human_review_node", human_review_node)
+    builder.add_node("compile_node", compile_node)
+    builder.add_node("compress_latex_node", compress_latex_node)
+    builder.add_node("cache_and_store_node", cache_and_store_node)
 
     # ── Entry point ───────────────────────────────────────────────────────────
-    builder.set_entry_point("ingest")
+    builder.set_entry_point("ingest_node")
 
     # ── Edges ─────────────────────────────────────────────────────────────────
-    builder.add_edge("ingest", "compress")
-    builder.add_edge("compress", "embed_and_cache")
+    builder.add_edge("ingest_node", "embed_and_cache_node")
 
-    # Conditional: cache hit can skip generate+critique
+    # Cache hit → END (pdf_url already in state); miss → analyze + generate
     builder.add_conditional_edges(
-        "embed_and_cache",
+        "embed_and_cache_node",
         route_after_cache,
+        {"hit": END, "miss": "analyze_latex_node"},
+    )
+
+    builder.add_edge("analyze_latex_node", "generate_node")
+
+    # Send() fan-out: generate_node output → N parallel critique_persona workers
+    builder.add_conditional_edges(
+        "generate_node",
+        fan_out_to_personas,
+        ["critique_persona"],  # target node name(s) used by Send()
+    )
+
+    builder.add_edge("critique_persona", "debate_node")
+    builder.add_edge("debate_node", "human_review_node")
+
+    # HITL routing: regen → generate_node; approve/edit → compile_node
+    builder.add_conditional_edges(
+        "human_review_node",
+        route_after_human,
         {
-            "generate": "generate",
-            "resolve": "resolve",
+            "generate_node": "generate_node",
+            "compile_node": "compile_node",
         },
     )
 
-    builder.add_edge("generate", "critique")
-    builder.add_edge("critique", "resolve")
-
-    # Conditional after resolve: iterate (with HITL) or end
+    # Compile routing: overflow/error → END; multi-page → compress; done → cache
     builder.add_conditional_edges(
-        "resolve",
-        route_after_resolve,
+        "compile_node",
+        route_after_compile,
         {
-            "iterate": "iterate",
+            "compress_latex_node": "compress_latex_node",
+            "cache_and_store_node": "cache_and_store_node",
             END: END,
         },
     )
 
-    # iterate → generate loop
-    builder.add_edge("iterate", "generate")
+    # Compression loop back to compile
+    builder.add_edge("compress_latex_node", "compile_node")
+
+    # Final storage → done
+    builder.add_edge("cache_and_store_node", END)
 
     # ── Compile with HITL interrupt ───────────────────────────────────────────
-    # The graph pauses before executing "iterate" — this is the HITL checkpoint.
-    # The frontend receives the full state (resume + critique) and the user
-    # decides to approve or submit feedback. On resume, user_iteration_feedback
-    # and approved are set on the state before re-entering.
-    checkpointer = MemorySaver()  # swap to Redis checkpointer for multi-worker prod
-    return builder.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["iterate"],
-    )
+    # Graph pauses inside human_review_node via interrupt(). No interrupt_before
+    # needed — interrupt() handles the checkpoint internally.
+    checkpointer = MemorySaver()  # swap for Redis in multi-worker prod
+    return builder.compile(checkpointer=checkpointer)
 
 
-# Module-level singleton
+# Module-level singleton used by main.py and tests
 graph = build_graph()
