@@ -4,8 +4,11 @@ embed_and_cache_node — two-level semantic cache backed by Supabase pgvector.
 Level 1: SHA-256 exact hash lookup (zero-cost for identical JDs)
 Level 2: text-embedding-3-small cosine similarity ≥ 0.92 (catches paraphrased JDs)
 
-On cache hit:  sets state.cache_hit = True and populates resume_output / critique_results
-On cache miss: stores jd_embedding on state for later use in store_cache()
+JD compression (LLMLingua-2) is performed here before hash computation so that
+the hash and embedding are based on the compressed text (stable signal).
+
+On cache hit:  returns {"cache_hit": True, "jd_hash": ..., "pdf_url": ..., "latex_output": ...}
+On cache miss: returns {"cache_hit": False, "jd_hash": ..., "jd_embedding": ..., "jd_compressed": ...}
 """
 
 from __future__ import annotations
@@ -18,7 +21,8 @@ from typing import Any
 import openai
 from supabase import create_client, Client
 
-from pipeline.schemas import CritiqueResult, GraphState, ResumeOutput
+from pipeline.nodes.compress import _get_compressor
+from pipeline.schemas import CritiqueResult, GraphState, LaTeXOutput
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +43,37 @@ async def _embed(text: str) -> list[float]:
     return response.data[0].embedding
 
 
-async def embed_and_cache_node(state: GraphState) -> GraphState:
-    """Check both cache levels. Return cache hit or enriched state for generation."""
+def _compress_jd(jd_raw: str) -> str:
+    """Run LLMLingua-2 compression on the JD; fall back to raw JD on failure."""
+    compressor = _get_compressor()
+    if compressor is None:
+        logger.warning("LLMLingua-2 unavailable — using raw JD for hash/embedding")
+        return jd_raw
+    try:
+        result = compressor.compress_prompt(
+            jd_raw,
+            rate=0.5,
+            force_tokens=["experience", "requirements", "skills",
+                          "responsibilities", "qualifications", "preferred", "required"],
+        )
+        compressed: str = result["compressed_prompt"]
+        logger.debug(
+            "JD compressed: %d → %d words",
+            len(jd_raw.split()),
+            len(compressed.split()),
+        )
+        return compressed
+    except Exception as exc:
+        logger.error("LLMLingua-2 compression failed: %s — using raw JD", exc)
+        return jd_raw
 
-    jd_text = state.jd_compressed or state.jd_raw
-    jd_hash = hashlib.sha256(jd_text.encode()).hexdigest()
+
+async def embed_and_cache_node(state: GraphState) -> dict:
+    """Check both cache levels. Return cache hit (with pdf_url) or miss for generation."""
+
+    # Compress JD before hash so identical-meaning JDs share a cache entry
+    compressed_jd = _compress_jd(state["jd_raw"])
+    jd_hash = hashlib.sha256(compressed_jd.encode()).hexdigest()
 
     supabase = _get_supabase()
 
@@ -51,7 +81,7 @@ async def embed_and_cache_node(state: GraphState) -> GraphState:
     try:
         exact = (
             supabase.table("resume_cache")
-            .select("id, resume_output, critique_output")
+            .select("id, latex_output, critique_output, pdf_url")
             .eq("jd_hash", jd_hash)
             .maybe_single()
             .execute()
@@ -61,31 +91,38 @@ async def embed_and_cache_node(state: GraphState) -> GraphState:
         exact = None
 
     if exact and exact.data:
+        row = exact.data
         logger.info("Cache hit (exact hash): %s", jd_hash[:16])
-        # Bump hit counter (fire-and-forget)
         try:
-            supabase.rpc(
-                "increment_hit_count", {"row_id": exact.data["id"]}
-            ).execute()
+            supabase.rpc("increment_hit_count", {"row_id": row["id"]}).execute()
         except Exception:
             pass
 
-        critique_raw: list[Any] = exact.data.get("critique_output") or []
-        return state.model_copy(
-            update={
-                "cache_hit": True,
-                "jd_hash": jd_hash,
-                "resume_output": ResumeOutput(**exact.data["resume_output"]),
-                "critique_results": [CritiqueResult(**c) for c in critique_raw],
-            }
-        )
+        latex_output: LaTeXOutput | None = None
+        if row.get("latex_output"):
+            try:
+                latex_output = LaTeXOutput(**row["latex_output"])
+            except Exception:
+                pass
+
+        return {
+            "cache_hit": True,
+            "jd_hash": jd_hash,
+            "jd_compressed": compressed_jd,
+            "pdf_url": row.get("pdf_url"),
+            "latex_output": latex_output,
+        }
 
     # ── Embed (needed for both level-2 search and future cache storage) ───────
     try:
-        embedding = await _embed(jd_text)
+        embedding = await _embed(compressed_jd)
     except Exception as exc:
         logger.error("Embedding failed: %s — proceeding without cache check", exc)
-        return state.model_copy(update={"jd_hash": jd_hash, "cache_hit": False})
+        return {
+            "cache_hit": False,
+            "jd_hash": jd_hash,
+            "jd_compressed": compressed_jd,
+        }
 
     # ── Level 2: semantic similarity search ───────────────────────────────────
     try:
@@ -108,57 +145,27 @@ async def embed_and_cache_node(state: GraphState) -> GraphState:
             row.get("similarity", 0),
             jd_hash[:16],
         )
-        critique_raw = row.get("critique_output") or []
-        return state.model_copy(
-            update={
-                "cache_hit": True,
-                "jd_hash": jd_hash,
-                "jd_embedding": embedding,
-                "resume_output": ResumeOutput(**row["resume_output"]),
-                "critique_results": [CritiqueResult(**c) for c in critique_raw],
-            }
-        )
+
+        latex_output = None
+        if row.get("latex_output"):
+            try:
+                latex_output = LaTeXOutput(**row["latex_output"])
+            except Exception:
+                pass
+
+        return {
+            "cache_hit": True,
+            "jd_hash": jd_hash,
+            "jd_compressed": compressed_jd,
+            "jd_embedding": embedding,
+            "pdf_url": row.get("pdf_url"),
+            "latex_output": latex_output,
+        }
 
     logger.info("Cache miss: %s", jd_hash[:16])
-    return state.model_copy(
-        update={
-            "cache_hit": False,
-            "jd_hash": jd_hash,
-            "jd_embedding": embedding,
-        }
-    )
-
-
-async def store_cache(state: GraphState) -> None:
-    """
-    Persist a successfully generated resume to the cache.
-    Called by the FastAPI app after a successful pipeline run (not a graph node).
-    """
-    if not state.resume_output or not state.jd_hash:
-        return
-
-    supabase = _get_supabase()
-    jd_text = state.jd_compressed or state.jd_raw
-
-    # Embed if not already done (shouldn't happen normally)
-    embedding = state.jd_embedding or await _embed(jd_text)
-
-    critique_json = (
-        [c.model_dump(mode="json") for c in state.critique_results]
-        if state.critique_results
-        else None
-    )
-
-    try:
-        supabase.table("resume_cache").upsert(
-            {
-                "jd_hash": state.jd_hash,
-                "jd_embedding": embedding,
-                "resume_output": state.resume_output.model_dump(mode="json"),
-                "critique_output": critique_json,
-            },
-            on_conflict="jd_hash",
-        ).execute()
-        logger.info("Stored resume in cache: %s", state.jd_hash[:16])
-    except Exception as exc:
-        logger.error("Failed to store cache entry: %s", exc)
+    return {
+        "cache_hit": False,
+        "jd_hash": jd_hash,
+        "jd_compressed": compressed_jd,
+        "jd_embedding": embedding,
+    }
