@@ -2,93 +2,149 @@
 Tests for pipeline nodes (without LLM calls — pure unit tests).
 """
 
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
 
-from pipeline.nodes.ingest import ingest_node
-from pipeline.nodes.iterate import iterate_node
-from pipeline.schemas import GraphState, ResumeOutput, ResumeSection, CritiqueResult, ConflictResolution
+from pipeline.nodes.ingest import ingest_node, _get_known_persona_ids
+from pipeline.schemas import GraphState
+
+
+_VALID_LATEX = r"""\documentclass{article}
+\begin{document}
+\section{Experience}
+\begin{itemize}
+\item Built Python services handling 50k req/s.
+\end{itemize}
+\end{document}"""
+
+_VALID_JD = "We are looking for a senior software engineer with 5+ years Python experience in distributed systems."
+
+
+def _state(**overrides) -> GraphState:
+    base: GraphState = {
+        "jd_raw": _VALID_JD,
+        "latex_input": _VALID_LATEX,
+        "selected_persona_ids": ["faang_bar_raiser"],
+        "cache_hit": False,
+        "compression_attempts": 0,
+        "overflow_error": False,
+        "critique_results": [],
+    }
+    base.update(overrides)
+    return base
 
 
 # ── ingest_node ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_ingest_node_passes_valid_jd():
-    state = GraphState(jd_raw="We are looking for a software engineer with 5+ years Python experience.")
-    result = await ingest_node(state)
-    assert result.error is None
-    assert result.jd_raw.startswith("We are looking")
+async def test_ingest_node_passes_valid_inputs(tmp_path, monkeypatch):
+    """Valid JD + LaTeX + known persona IDs → returns dict with cleaned values."""
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    (personas_dir / "faang_bar_raiser.md").write_text("# FAANG Bar Raiser")
+
+    with patch("pipeline.nodes.ingest._PERSONAS_DIR", personas_dir):
+        result = await ingest_node(_state())
+
+    assert result.get("error") is None
+    assert result["jd_raw"].startswith("We are looking")
+    assert "\\begin{document}" in result["latex_input"]
+    assert result["selected_persona_ids"] == ["faang_bar_raiser"]
 
 
 @pytest.mark.asyncio
-async def test_ingest_node_rejects_short_jd():
-    state = GraphState(jd_raw="Too short")
-    result = await ingest_node(state)
-    assert result.error is not None
-    assert "too short" in result.error.lower()
+async def test_ingest_node_rejects_short_jd(tmp_path, monkeypatch):
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    (personas_dir / "faang_bar_raiser.md").write_text("# FAANG Bar Raiser")
+
+    with patch("pipeline.nodes.ingest._PERSONAS_DIR", personas_dir):
+        result = await ingest_node(_state(jd_raw="Too short"))
+
+    assert result.get("error") is not None
+    assert "too short" in result["error"].lower()
 
 
 @pytest.mark.asyncio
-async def test_ingest_node_truncates_long_jd():
-    long_jd = "x " * 5000  # ~10 000 chars
-    state = GraphState(jd_raw=long_jd)
-    result = await ingest_node(state)
-    assert result.error is None
-    assert len(result.jd_raw) <= 8000
+async def test_ingest_node_truncates_long_jd(tmp_path):
+    long_jd = "software engineer " * 600  # >> 8000 chars
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    (personas_dir / "faang_bar_raiser.md").write_text("# FAANG Bar Raiser")
+
+    with patch("pipeline.nodes.ingest._PERSONAS_DIR", personas_dir):
+        result = await ingest_node(_state(jd_raw=long_jd))
+
+    assert result.get("error") is None
+    assert len(result["jd_raw"]) <= 8000
 
 
 @pytest.mark.asyncio
-async def test_ingest_node_strips_null_bytes():
-    state = GraphState(jd_raw="Software\x00 engineer role with Python experience required.")
-    result = await ingest_node(state)
-    assert "\x00" not in result.jd_raw
+async def test_ingest_node_rejects_missing_begin_document(tmp_path):
+    bad_latex = r"\documentclass{article}% no begin document here"
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    (personas_dir / "faang_bar_raiser.md").write_text("# FAANG Bar Raiser")
 
+    with patch("pipeline.nodes.ingest._PERSONAS_DIR", personas_dir):
+        result = await ingest_node(_state(latex_input=bad_latex))
 
-# ── iterate_node ──────────────────────────────────────────────────────────────
-
-def _make_resume() -> ResumeOutput:
-    return ResumeOutput(
-        headline="Software Engineer",
-        summary=ResumeSection(content="5 years Python."),
-        experience=[ResumeSection(content="Built APIs handling 10k req/s, reducing latency by 30%.")],
-        skills=ResumeSection(content="Python, FastAPI, PostgreSQL"),
-        education=ResumeSection(content="BSc CS, MIT 2018"),
-        format_used="XYZ",
-        ats_score_estimate=80,
-        word_count=25,
-    )
+    assert result.get("error") is not None
+    assert "latex" in result["error"].lower()
 
 
 @pytest.mark.asyncio
-async def test_iterate_node_clears_outputs():
-    critique = CritiqueResult(
-        role="recruiter",
-        score=70,
-        flags=["Missing keyword"],
-        suggestions=["Add Python"],
-        ai_slop_detected=False,
-        jd_match_confidence=75,
-    )
-    state = GraphState(
-        jd_raw="Python engineer role",
-        resume_output=_make_resume(),
-        critique_results=[critique],
-        cache_hit=True,
-    )
-    result = await iterate_node(state)
+async def test_ingest_node_rejects_unknown_persona_ids(tmp_path):
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    (personas_dir / "faang_bar_raiser.md").write_text("# FAANG Bar Raiser")
 
-    assert result.resume_output is None
-    assert result.critique_results == []
-    assert result.conflict_resolution is None
-    assert result.cache_hit is False  # force fresh LLM call
+    with patch("pipeline.nodes.ingest._PERSONAS_DIR", personas_dir):
+        result = await ingest_node(_state(selected_persona_ids=["faang_bar_raiser", "ghost_persona"]))
+
+    assert result.get("error") is not None
+    assert "ghost_persona" in result["error"]
 
 
 @pytest.mark.asyncio
-async def test_iterate_node_preserves_jd_and_feedback():
-    state = GraphState(
-        jd_raw="Python engineer role",
-        user_iteration_feedback="Make the summary shorter",
-        resume_output=_make_resume(),
-    )
-    result = await iterate_node(state)
-    assert result.jd_raw == "Python engineer role"
-    assert result.user_iteration_feedback == "Make the summary shorter"
+async def test_ingest_node_rejects_empty_persona_ids(tmp_path):
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+
+    with patch("pipeline.nodes.ingest._PERSONAS_DIR", personas_dir):
+        result = await ingest_node(_state(selected_persona_ids=[]))
+
+    assert result.get("error") is not None
+    assert "persona" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_ingest_node_strips_null_bytes(tmp_path):
+    dirty_jd = "Software\x00 engineer role with Python experience required for distributed systems."
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    (personas_dir / "faang_bar_raiser.md").write_text("# FAANG Bar Raiser")
+
+    with patch("pipeline.nodes.ingest._PERSONAS_DIR", personas_dir):
+        result = await ingest_node(_state(jd_raw=dirty_jd))
+
+    assert "\x00" not in result["jd_raw"]
+
+
+def test_get_known_persona_ids_scans_md_files(tmp_path):
+    personas_dir = tmp_path / "personas"
+    personas_dir.mkdir()
+    (personas_dir / "faang_bar_raiser.md").write_text("# FAANG")
+    (personas_dir / "startup_cto.md").write_text("# CTO")
+    (personas_dir / "not_a_persona.txt").write_text("ignored")
+
+    with patch("pipeline.nodes.ingest._PERSONAS_DIR", personas_dir):
+        ids = _get_known_persona_ids()
+
+    assert "faang_bar_raiser" in ids
+    assert "startup_cto" in ids
+    assert "not_a_persona" not in ids
