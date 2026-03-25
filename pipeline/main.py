@@ -35,7 +35,6 @@ from pydantic import BaseModel
 load_dotenv()  # load .env / .env.local in development
 
 from pipeline.graph import graph  # noqa: E402 (must be after load_dotenv)
-from pipeline.nodes.cache import store_cache  # noqa: E402
 from pipeline.schemas import GraphState  # noqa: E402
 from compiler import compile_latex  # noqa: E402
 from models import CompileJob, CompileResult  # noqa: E402
@@ -116,38 +115,52 @@ def verify_pipeline_secret(request: Request) -> None:
 
 class GenerateRequest(BaseModel):
     jd_raw: str
-    resume_raw: str | None = None
+    latex_input: str
+    selected_persona_ids: list[str]
     thread_id: str | None = None
-    user_iteration_feedback: str | None = None
-    approved: bool = False
+    # HITL resume fields — set when the frontend POSTs Command(resume={...})
+    human_decision: str | None = None   # "approve" | "edit" | "regen"
+    edited_latex: str | None = None
+
+
+class PersonaGenerateRequest(BaseModel):
+    description: str   # plain-English description of the desired persona
 
 
 # ── SSE streaming ─────────────────────────────────────────────────────────────
 
+_STREAM_NODES = {
+    "ingest_node", "embed_and_cache_node", "analyze_latex_node",
+    "generate_node", "critique_persona", "debate_node",
+    "human_review_node", "compile_node", "compress_latex_node",
+    "cache_and_store_node",
+}
+
+
 async def _stream_graph_events(
-    initial_state: GraphState,
+    input_or_command: Any,
     thread_id: str,
 ) -> AsyncGenerator[str, None]:
     """
     Yield SSE events for each LangGraph node completion.
     Each event carries: { node: str, state: dict }
     On completion yields: data: [DONE]
+
+    input_or_command may be a plain GraphState dict (new run) or a
+    langgraph.types.Command object (HITL resume).
     """
     config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
 
     try:
         async for event in graph.astream_events(
-            initial_state.to_serializable(),
+            input_or_command,
             config=config,
             version="v2",
         ):
             event_type: str = event.get("event", "")
             name: str = event.get("name", "")
 
-            if event_type == "on_chain_end" and name in {
-                "ingest", "compress", "embed_and_cache",
-                "generate", "critique", "resolve", "iterate",
-            }:
+            if event_type == "on_chain_end" and name in _STREAM_NODES:
                 output_data: dict[str, Any] = event.get("data", {}).get("output", {})
                 payload = json.dumps({"node": name, "state": output_data})
                 yield f"data: {payload}\n\n"
@@ -170,43 +183,48 @@ async def generate(
     """
     Start or resume a graph run.
 
-    - First call: provide jd_raw (+ optional resume_raw). A new thread_id is allocated.
-    - Subsequent calls (iteration): provide the same thread_id + user_iteration_feedback.
-    - To approve and end the loop: set approved=True.
+    New run:   provide jd_raw + latex_input + selected_persona_ids.
+               A new thread_id is minted and returned in X-Thread-ID header.
+    HITL resume: provide the same thread_id + human_decision (+ edited_latex if "edit").
+                 The graph resumes from the interrupt() checkpoint.
     """
+    from langgraph.types import Command  # local import avoids circular at module level
+
     lf = Langfuse()
     trace = lf.trace(
         name="resume_generation",
         metadata={
-            "has_resume": bool(req.resume_raw),
-            "is_iteration": bool(req.thread_id),
+            "is_resume": bool(req.human_decision),
+            "thread_id": req.thread_id,
         },
     )
 
     thread_id = req.thread_id or str(uuid.uuid4())
 
-    initial_state = GraphState(
-        jd_raw=req.jd_raw,
-        resume_raw=req.resume_raw,
-        user_iteration_feedback=req.user_iteration_feedback,
-        approved=req.approved,
-        langfuse_trace_id=trace.id,
-    )
+    if req.human_decision:
+        # HITL resume — graph was paused at human_review_node via interrupt()
+        input_or_command = Command(
+            resume={
+                "decision": req.human_decision,
+                "edited_latex": req.edited_latex,
+            }
+        )
+    else:
+        # New run
+        input_or_command = {
+            "jd_raw": req.jd_raw,
+            "latex_input": req.latex_input,
+            "selected_persona_ids": req.selected_persona_ids,
+            "cache_hit": False,
+            "compression_attempts": 0,
+            "overflow_error": False,
+            "critique_results": [],
+            "langfuse_trace_id": trace.id,
+        }
 
     async def _event_generator() -> AsyncGenerator[bytes, None]:
-        async for chunk in _stream_graph_events(initial_state, thread_id):
+        async for chunk in _stream_graph_events(input_or_command, thread_id):
             yield chunk.encode()
-
-        # After graph completes, attempt to cache the result
-        try:
-            final_config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
-            snapshot = graph.get_state(final_config)
-            if snapshot and snapshot.values:
-                final_state = GraphState(**snapshot.values)
-                if final_state.resume_output and not final_state.cache_hit:
-                    await store_cache(final_state)
-        except Exception as exc:
-            logger.warning("Cache storage failed after generation: %s", exc)
 
     return StreamingResponse(
         _event_generator(),
@@ -244,6 +262,82 @@ async def cache_status(
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/personas/generate")
+async def personas_generate(
+    req: PersonaGenerateRequest,
+    request: Request,
+    _: None = Depends(verify_pipeline_secret),
+) -> dict[str, Any]:
+    """
+    Generate a new persona markdown from a plain-English description.
+
+    The caller (Next.js route handler) must set X-User-ID to the authenticated user's UUID.
+    The generated persona is inserted into the Supabase personas table.
+    """
+    import re
+    import anthropic as _anthropic
+    from supabase import create_client
+
+    user_id: str | None = request.headers.get("X-User-ID")
+
+    client = _anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+    system_prompt = (
+        "You are a resume evaluation expert who creates brutally honest, highly specific "
+        "technical hiring personas. Generate a persona markdown file following this exact format:\n\n"
+        "# [Persona Name]\n\n"
+        "## Background\n"
+        "[3 sentences about role, years of experience, specific companies/context]\n\n"
+        "## Focus Areas\n"
+        "- [5 specific evaluation bullets]\n\n"
+        "## Scoring Rubric\n"
+        "- [Issue description]: -[N] pts\n"
+        "...(5-7 rubric items)\n\n"
+        "## Signature Flag\n"
+        '> "[One damning quote they always say when reviewing a weak resume]"\n\n'
+        "Be specific, brutal, and opinionated. Avoid generic platitudes."
+    )
+
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": f"Create a hiring persona for: {req.description}"}],
+        system=system_prompt,
+    )
+    markdown = message.content[0].text.strip()
+
+    # Extract persona name from first heading
+    name_match = re.match(r"#\s+(.+)", markdown)
+    name = name_match.group(1).strip() if name_match else req.description[:50]
+
+    # Derive a slug persona_id from the name
+    persona_id = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+    row: dict[str, Any] = {
+        "name": name,
+        "persona_id": persona_id,
+        "markdown": markdown,
+        "user_id": user_id,
+        "is_public": False,
+    }
+
+    try:
+        supabase = create_client(
+            os.environ["SUPABASE_URL"],
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+        )
+        result = supabase.table("personas").upsert(
+            row,
+            on_conflict="user_id,persona_id",
+        ).execute()
+        saved = result.data[0] if result.data else row
+    except Exception as exc:
+        logger.error("personas_generate: Supabase insert failed: %s", exc)
+        saved = row
+
+    return saved
 
 
 @app.post("/compile-direct")
