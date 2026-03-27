@@ -41,8 +41,7 @@ async def compress_latex_node(state: GraphState) -> dict:
     attempts = (state.get("compression_attempts") or 0) + 1
 
     lf = Langfuse()
-    span = lf.span(
-        trace_id=state.get("langfuse_trace_id"),
+    span = lf.start_observation(
         name="compress_latex_node",
         metadata={"compression_attempts": attempts},
     )

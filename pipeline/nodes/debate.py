@@ -29,7 +29,7 @@ from pipeline.schemas import (
 logger = logging.getLogger(__name__)
 
 _PERSONAS_DIR = Path(__file__).parent.parent / "personas"
-_MODEL = "claude-sonnet-4-6"
+_MODEL = "claude-haiku-4-5-20251001"
 
 
 async def _run_debate_response(
@@ -48,8 +48,7 @@ async def _run_debate_response(
     persona_prompt = persona_path.read_text(encoding="utf-8")
 
     lf = Langfuse()
-    span = lf.span(
-        trace_id=langfuse_trace_id,
+    span = lf.start_observation(
         name=f"debate_{persona_id}",
         metadata={"persona_id": persona_id},
     )
@@ -106,7 +105,7 @@ Use responding_to_persona_ids={other_ids!r}.
             responding_to_persona_ids=other_ids,
             agreements=[],
             disagreements=[],
-            synthesis=f"(error: {exc})",
+            synthesis=f"(error: {str(exc)[:200]})",
         )
 
     span.update(metadata={"responding_persona_id": round_result.responding_persona_id})
@@ -122,8 +121,7 @@ async def _synthesise_consensus(
 ) -> DebateConsensus:
     """Feed all critiques + debate rounds to Claude and extract a DebateConsensus."""
     lf = Langfuse()
-    span = lf.span(
-        trace_id=langfuse_trace_id,
+    span = lf.start_observation(
         name="debate_consensus",
         metadata={"persona_count": len(critiques)},
     )
@@ -176,7 +174,7 @@ Based on the above, produce a DebateConsensus JSON that captures:
             blocking_issues=all_flags[:5],
             optional_improvements=[],
             consensus_score=int(sum(c.score for c in critiques) / max(len(critiques), 1)),
-            summary=f"Consensus synthesis failed: {exc}",
+            summary=f"Consensus synthesis failed: {str(exc)[:200]}",
         )
 
     span.update(metadata={

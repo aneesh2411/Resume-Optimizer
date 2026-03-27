@@ -13,9 +13,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY . pipeline/
 
 # Tectonic caches TeX packages here on first run
 ENV TECTONIC_CACHE_DIR=/tmp/tectonic-cache
+ENV COMPILE_WORKER_ENABLED=true
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "pipeline.main:app", "--host", "0.0.0.0", "--port", "8000"]

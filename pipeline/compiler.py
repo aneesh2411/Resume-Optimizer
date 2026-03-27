@@ -5,7 +5,7 @@ import os
 
 from pypdf import PdfReader
 
-from models import CompileJob
+from pipeline.models import CompileJob
 
 
 def compile_latex(job: CompileJob) -> tuple[bool, bytes, str, int]:

@@ -26,19 +26,21 @@ from typing import Any
 
 from azure.servicebus.aio import ServiceBusClient
 from dotenv import load_dotenv
+from upstash_redis.asyncio import Redis as AsyncRedis
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langfuse import Langfuse
 from pydantic import BaseModel
 
-load_dotenv()  # load .env / .env.local in development
+load_dotenv()                              # load .env
+load_dotenv(".env.local", override=True)  # override with .env.local if present
 
 from pipeline.graph import graph  # noqa: E402 (must be after load_dotenv)
 from pipeline.schemas import GraphState  # noqa: E402
-from compiler import compile_latex  # noqa: E402
-from models import CompileJob, CompileResult  # noqa: E402
-from storage import upload_pdf  # noqa: E402
+from pipeline.compiler import compile_latex  # noqa: E402
+from pipeline.models import CompileJob, CompileResult  # noqa: E402
+from pipeline.storage import upload_pdf  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,40 +50,70 @@ logger = logging.getLogger(__name__)
 
 async def _process_compile_jobs() -> None:
     """Background task: consume LaTeX compile jobs from Azure Service Bus."""
+    redis = AsyncRedis(
+        url=os.environ["UPSTASH_REDIS_REST_URL"],
+        token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+    )
     async with ServiceBusClient.from_connection_string(
         os.environ["SERVICEBUS_CONN"]
     ) as client:
-        async with client.get_queue_receiver(
-            queue_name=os.environ["SERVICEBUS_QUEUE"],
-            max_wait_time=5,
-        ) as receiver:
-            logger.info("Listening for compile jobs on queue '%s'...", os.environ["SERVICEBUS_QUEUE"])
-            async for msg in receiver:
-                try:
-                    data = json.loads(str(msg))
-                    job = CompileJob(**data)
-                    logger.info("Processing compile job %s for user %s", job.job_id, job.user_id)
+        logger.info("Listening for compile jobs on queue '%s'...", os.environ["SERVICEBUS_QUEUE"])
+        while True:
+            async with client.get_queue_receiver(
+                queue_name=os.environ["SERVICEBUS_QUEUE"],
+                max_wait_time=5,
+            ) as receiver:
+                async for msg in receiver:
+                    try:
+                        data = json.loads(msg.body)
+                        job = CompileJob(**data)
+                        logger.info("Processing compile job %s for user %s", job.job_id, job.user_id)
 
-                    success, pdf_bytes, error, page_count = compile_latex(job)
+                        success, pdf_bytes, error, page_count = compile_latex(job)
 
-                    if success:
-                        pdf_url = upload_pdf(job.job_id, pdf_bytes)
-                        logger.info("Compile job %s complete: %s", job.job_id, pdf_url)
-                    else:
-                        logger.error("Compile job %s failed: %s", job.job_id, error[:200])
+                        if success:
+                            pdf_url = upload_pdf(job.job_id, pdf_bytes)
+                            result = CompileResult(
+                                job_id=job.job_id,
+                                success=True,
+                                pdf_url=pdf_url,
+                                page_count=page_count,
+                            )
+                            logger.info("Compile job %s complete: %s", job.job_id, pdf_url)
+                        else:
+                            result = CompileResult(
+                                job_id=job.job_id,
+                                success=False,
+                                error=error,
+                                page_count=0,
+                            )
+                            logger.error("Compile job %s failed: %s", job.job_id, error[:200])
 
-                    await receiver.complete_message(msg)
+                        await redis.setex(
+                            f"compile_result:{job.job_id}",
+                            3600,
+                            result.model_dump_json(),
+                        )
+                        await receiver.complete_message(msg)
 
-                except Exception as exc:
-                    logger.error("Fatal error processing compile job: %s", exc)
-                    await receiver.dead_letter_message(msg, reason=str(exc))
+                    except Exception as exc:
+                        logger.error(
+                            "Fatal error processing compile job (body=%r): %s",
+                            str(msg.body)[:200],
+                            exc,
+                            exc_info=True,
+                        )
+                        await receiver.dead_letter_message(msg, reason=str(exc)[:4096])
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_process_compile_jobs())
+    task = None
+    if os.getenv("COMPILE_WORKER_ENABLED", "").lower() == "true":
+        task = asyncio.create_task(_process_compile_jobs())
     yield
-    task.cancel()
+    if task:
+        task.cancel()
 
 
 app = FastAPI(title="Resume Pipeline", version="0.1.0", docs_url="/docs", lifespan=lifespan)
@@ -162,8 +194,24 @@ async def _stream_graph_events(
 
             if event_type == "on_chain_end" and name in _STREAM_NODES:
                 output_data: dict[str, Any] = event.get("data", {}).get("output", {})
-                payload = json.dumps({"node": name, "state": output_data})
+                payload = json.dumps(
+                    {"node": name, "state": output_data},
+                    default=lambda o: o.model_dump() if hasattr(o, "model_dump") else repr(o),
+                )
                 yield f"data: {payload}\n\n"
+
+            # Detect LangGraph interrupt() — emitted as on_chain_stream with __interrupt__ key
+            elif event_type == "on_chain_stream" and name == "LangGraph":
+                chunk = event.get("data", {}).get("chunk", {})
+                if "__interrupt__" in chunk:
+                    interrupts = chunk["__interrupt__"]
+                    if interrupts:
+                        interrupt_value = interrupts[0].value if hasattr(interrupts[0], "value") else interrupts[0]
+                        payload = json.dumps(
+                            {"node": "human_review_node", "state": {"hitl": interrupt_value}},
+                            default=lambda o: o.model_dump() if hasattr(o, "model_dump") else repr(o),
+                        )
+                        yield f"data: {payload}\n\n"
 
     except Exception as exc:
         logger.error("Graph streaming error (thread=%s): %s", thread_id, exc)
@@ -191,7 +239,7 @@ async def generate(
     from langgraph.types import Command  # local import avoids circular at module level
 
     lf = Langfuse()
-    trace = lf.trace(
+    trace = lf.start_observation(
         name="resume_generation",
         metadata={
             "is_resume": bool(req.human_decision),
@@ -219,7 +267,7 @@ async def generate(
             "compression_attempts": 0,
             "overflow_error": False,
             "critique_results": [],
-            "langfuse_trace_id": trace.id,
+            "langfuse_trace_id": trace.trace_id,
         }
 
     async def _event_generator() -> AsyncGenerator[bytes, None]:
@@ -256,7 +304,8 @@ async def cache_status(
         .maybe_single()
         .execute()
     )
-    return {"cached": bool(result.data), "data": result.data}
+    data = result.data if result is not None else None
+    return {"cached": bool(data), "data": data}
 
 
 @app.get("/health")

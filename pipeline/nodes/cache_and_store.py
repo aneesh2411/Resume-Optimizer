@@ -31,8 +31,7 @@ async def cache_and_store_node(state: GraphState) -> dict:
     rather than inserting a duplicate.
     """
     lf = Langfuse()
-    span = lf.span(
-        trace_id=state.get("langfuse_trace_id"),
+    span = lf.start_observation(
         name="cache_and_store_node",
         metadata={
             "jd_hash": state.get("jd_hash"),

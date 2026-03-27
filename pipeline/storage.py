@@ -7,16 +7,23 @@ from azure.storage.blob import (
     generate_blob_sas,
 )
 
-blob_service = BlobServiceClient.from_connection_string(
-    os.environ["AZURE_STORAGE_CONN"]
-)
 CONTAINER = "pdfs"
+_blob_service: BlobServiceClient | None = None
+
+
+def _get_blob_service() -> BlobServiceClient:
+    global _blob_service
+    if _blob_service is None:
+        _blob_service = BlobServiceClient.from_connection_string(
+            os.environ["AZURE_STORAGE_CONN"]
+        )
+    return _blob_service
 
 
 def upload_pdf(job_id: str, pdf_bytes: bytes) -> str:
     """Upload PDF bytes to Azure Blob Storage and return a signed URL valid for 2 hours."""
     blob_name = f"resumes/{job_id}.pdf"
-    container_client = blob_service.get_container_client(CONTAINER)
+    container_client = _get_blob_service().get_container_client(CONTAINER)
 
     container_client.upload_blob(
         name=blob_name,

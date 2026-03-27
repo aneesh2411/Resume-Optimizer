@@ -20,7 +20,7 @@ from pipeline.schemas import ConflictResolution, GraphState
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "claude-sonnet-4-6"
+_MODEL = "claude-haiku-4-5-20251001"
 
 _SYSTEM_PROMPT = """\
 You are a senior hiring strategist with expertise in resume optimisation.
@@ -75,7 +75,6 @@ async def join_and_resolve_node(state: GraphState) -> GraphState:
     """Synthesise critique results into actionable ConflictResolution."""
 
     lf = Langfuse()
-    span = lf.span(trace_id=state.langfuse_trace_id, name="resolve_conflicts")
 
     # Format critique results for the LLM
     critiques_text = "\n\n".join([

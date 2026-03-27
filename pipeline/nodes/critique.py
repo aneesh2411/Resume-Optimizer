@@ -26,7 +26,7 @@ from pipeline.schemas import CritiqueResult, GraphState
 logger = logging.getLogger(__name__)
 
 _PERSONAS_DIR = Path(__file__).parent.parent / "personas"
-_MODEL = "claude-sonnet-4-6"
+_MODEL = "claude-haiku-4-5-20251001"
 
 _AI_SLOP_PHRASES = [
     "leveraged synergies",
@@ -110,8 +110,7 @@ async def critique_persona_node(state: PersonaState) -> dict:
     jd = state.get("jd_compressed") or state["jd_raw"]
 
     lf = Langfuse()
-    span = lf.span(
-        trace_id=state.get("langfuse_trace_id"),
+    span = lf.start_observation(
         name=f"critique_{persona_id}",
         metadata={"persona_id": persona_id},
     )
@@ -135,7 +134,7 @@ Use persona_id="{persona_id}" in your response.
     try:
         result = await client.messages.create(
             model=_MODEL,
-            max_tokens=1024,
+            max_tokens=4096,
             system=persona_prompt,
             messages=[{"role": "user", "content": user_msg}],
             response_model=CritiqueResult,

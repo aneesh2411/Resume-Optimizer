@@ -42,8 +42,7 @@ async def human_review_node(state: GraphState) -> dict:
     }
 
     lf = Langfuse()
-    span = lf.span(
-        trace_id=state.get("langfuse_trace_id"),
+    span = lf.start_observation(
         name="human_review",
         metadata={"has_consensus": consensus is not None},
     )

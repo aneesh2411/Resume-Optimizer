@@ -55,8 +55,7 @@ async def generate_node(state: GraphState) -> dict:
         return {}
 
     lf = Langfuse()
-    span = lf.span(
-        trace_id=state.get("langfuse_trace_id"),
+    span = lf.start_observation(
         name="generate_latex_resume",
         metadata={"is_regen": state.get("human_decision") == "regen"},
     )
